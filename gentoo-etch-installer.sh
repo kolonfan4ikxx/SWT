@@ -1,6 +1,195 @@
+#!/usr/bin/env bash
+# Gentoo Etch Installer — interactive AMD64 installer
+# UEFI/BIOS, GPT, ext4/Btrfs/XFS, OpenRC/systemd Stage3, Portage, chroot setup.
+# Disk partitioning is destructive and requires typing the selected device path.
+set -Eeuo pipefail
+export LC_ALL=C
+APP='Gentoo Etch Installer'
+VER='0.3'
+TARGET=/mnt/gentoo
+DISK=''
+BOOT_MODE=''
+ROOTFS=ext4
+INIT=openrc
+MIRROR=https://distfiles.gentoo.org
+MAKEOPTS='-j2'
+HOSTNAME=gentoo
+GRUB_TITLE='Gentoo Linux'
+LOGLEVEL=3
+QUIET=yes
+TIMEZONE=UTC
+LOCALE=en_US.UTF-8
+KEYMAP=us
+ROOT_PASSWORD=''
+NEW_USER=''
+USER_PASSWORD=''
+SWAP=yes
+SWAP_SIZE=2G
+STAGE3_FILE=''
+STAGE3_URL=''
+NETWORK=yes
+SSH=no
+INSTALL_KERNEL=yes
+INSTALL_GRUB=yes
+INSTALL_FIRMWARE=yes
+TUI=''
+MOUNTS=()
 
-    
-  
+fail(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+cleanup(){ local i; for ((i=${#MOUNTS[@]}-1;i>=0;i--)); do umount -R "${MOUNTS[i]}" 2>/dev/null || true; done; }
+trap cleanup EXIT
+need_root(){ [[ $EUID -eq 0 ]] || fail "Run as root: sudo $0"; }
+init_tui(){ if have whiptail; then TUI=whiptail; elif have dialog; then TUI=dialog; else fail 'Install whiptail or dialog in the live environment.'; fi; }
+msg(){ "$TUI" --title "$APP $VER" --msgbox "$1" 14 76; }
+yesno(){ "$TUI" --title "$APP $VER" --yesno "$1" 12 76; }
+menu(){ "$TUI" --title "$APP $VER" --menu "$1" 20 78 12 "${@:2}" 3>&1 1>&2 2>&3; }
+ask(){ local v; v=$("$TUI" --title "$APP $VER" --inputbox "$1" 10 76 "${2:-}" 3>&1 1>&2 2>&3) || return 1; REPLY=$v; }
+secret(){ local v; v=$("$TUI" --title "$APP $VER" --passwordbox "$1" 10 76 3>&1 1>&2 2>&3) || return 1; REPLY=$v; }
+detect_boot(){ [[ -d /sys/firmware/efi ]] && BOOT_MODE=uefi || BOOT_MODE=bios; }
+
+art(){ clear; cat <<'ART'
+                                                              @
+                                                             @*@
+                                                             *-#
+                                                            @=.+
+                                                            #-.-#
+                                                            +...+
+                                                           @-...-%
+                                                           *:...:*
+                                                          @=.....-@
+                                                          #:.....:*
+                                                          +.......=@
+                                                         @-.......=%
+                                                          *=:...:@
+                                                           @*:.:#
+                                                             *:+
+                                                             #-*
+                                                             #-*
+                                                             *-*
+                                                             *:*
+                                                             *:*
+                                                             *:*
+                                                             *:+
+                                                             *.+
+                                                             +.+
+                                                             +.=@
+                                                            @+.=@
+                                                           @*-.-%
+                                                          #+:...-%
+                                                        @*-...-..-*@
+                                                       *=:..-=-=-..=#@
+                                                     *+:..:=-..:-=:.:+%
+                                                     *..:==:.....:=-:.-#
+                                                     +.:=:.........:=::*
+                                                     +.--...........--:*
+                                                     +.--...........--:*
+                                                     +.--...........--:*
+                                                     +.--...........--:*
+                                                     +.--...........--:*
+                                                     *.--...........--:*
+                                                    *:.--...........--:*
+                                                  @*:..:=-.........:=:.-%
+                                                 #=...:..-=-.....:=-:.:.:*@
+                                                *-...-+-..:-=:..-=:.:=+-..-*@
+                                              @*:..-+# #*-..:=-=-.:-*@ #+-.:=#
+                                      *+%    %=..:+#     #+-..-:.-*%     #+-.-*%    #**
+                                     #:.-*@@#-.:=*@        *+:.-+#         #+-:=*@@%-.-*
+                                    %-...:-=::-*@            *+*             #*-:-=-...-%
+                                    +.......-*@                                #+.......+
+                                   *:......:%                                   %-......:*
+                                  %-.......-@                                   @=.......-#
+                                 @=........-@                                   @-........=@
+                                 *:........-@                                   %-.........+
+                                #-....::--=+@                                   %+=--::....:*
+                               @=--==++**#@@                                     @@#**++==---%
+                               #**#@@                                                    @%**#
+ART
+ echo; echo '                 G E N T O O   L I N U X   S E T U P'; sleep 1; }
+
+select_disk(){
+ local -a opts=(); local dev size model type confirm
+ while read -r dev size type; do [[ $type == disk ]] && opts+=("$dev" "$size"); done < <(lsblk -dpno NAME,SIZE,TYPE)
+ ((${#opts[@]})) || { msg 'No disks detected.'; return 1; }
+ DISK=$(menu 'Select the disk to erase completely:' "${opts[@]}") || return 1
+ [[ -b $DISK ]] || { msg 'Not a block device.'; return 1; }
+ if lsblk -nrpo MOUNTPOINT "$DISK" | grep -qE '^/'; then msg 'A partition on this disk is mounted. Unmount it first.'; return 1; fi
+ ask "ALL DATA ON $DISK WILL BE ERASED. Type $DISK to confirm:" '' || return 1
+ confirm=$REPLY; [[ $confirm == "$DISK" ]] || { msg 'Confirmation mismatch; disk unchanged.'; return 1; }
+}
+partition_disk(){
+ have parted && have partprobe && have wipefs || fail 'Install parted, util-linux and e2fsprogs in the live environment.'
+ have mkswap || fail 'Install util-linux (mkswap).'; have mkfs.fat || { [[ $(detect_boot; echo $BOOT_MODE) == bios ]] || fail 'Install dosfstools (mkfs.fat).'; }
+ case ${ROOTFS:-ext4} in ext4) have mkfs.ext4 || fail 'Install e2fsprogs.';; btrfs) have mkfs.btrfs || fail 'Install btrfs-progs.';; xfs) have mkfs.xfs || fail 'Install xfsprogs.';; esac
+ select_disk || return
+ detect_boot
+ local swapchoice fchoice p1 p2 p3 swappart='' rootpart bootpart=''
+ swapchoice=$(menu 'Create swap partition?' yes Yes no No) || return; SWAP=$swapchoice
+ if [[ $SWAP == yes ]]; then ask 'Swap size (e.g. 2G):' "$SWAP_SIZE" || return; SWAP_SIZE=$REPLY; [[ $SWAP_SIZE =~ ^[1-9][0-9]*[MG]$ ]] || { msg 'Invalid size. Use e.g. 2G.'; return; }; fi
+ fchoice=$(menu 'Root filesystem:' ext4 ext4 btrfs Btrfs xfs XFS) || return; ROOTFS=$fchoice
+ case $ROOTFS in ext4) have mkfs.ext4 || fail 'Install e2fsprogs.';; btrfs) have mkfs.btrfs || fail 'Install btrfs-progs.';; xfs) have mkfs.xfs || fail 'Install xfsprogs.';; esac
+ if [[ $BOOT_MODE == uefi ]]; then have mkfs.fat || fail 'Install dosfstools.'; fi
+ if [[ $SWAP == yes ]]; then have mkswap || fail 'Install util-linux.'; fi
+ if ! yesno "FINAL WARNING: wipe and repartition $DISK?\nBoot mode: $BOOT_MODE\nFilesystem: $ROOTFS\nSwap: $SWAP"; then return; fi
+ local base=${DISK##*/}; if [[ $base =~ [0-9]$ ]]; then p1="${DISK}p1"; p2="${DISK}p2"; p3="${DISK}p3"; else p1="${DISK}1"; p2="${DISK}2"; p3="${DISK}3"; fi
+ local start_mib end_mib swap_mib
+ if [[ $BOOT_MODE == uefi ]]; then start_mib=1025; else start_mib=3; fi
+ if [[ $SWAP == yes ]]; then
+   if [[ $SWAP_SIZE == *G ]]; then swap_mib=$(( ${SWAP_SIZE%G} * 1024 )); else swap_mib=${SWAP_SIZE%M}; fi
+   end_mib=$((start_mib + swap_mib))
+ fi
+ wipefs -af "$DISK"; parted -s "$DISK" mklabel gpt
+ if [[ $BOOT_MODE == uefi ]]; then
+   parted -s "$DISK" mkpart ESP fat32 1MiB 1025MiB; parted -s "$DISK" set 1 esp on; bootpart=$p1
+ else
+   parted -s "$DISK" mkpart bios_grub 1MiB 3MiB; parted -s "$DISK" set 1 bios_grub on
+ fi
+ if [[ $SWAP == yes ]]; then
+   parted -s "$DISK" mkpart primary linux-swap "${start_mib}MiB" "${end_mib}MiB"
+   if [[ $BOOT_MODE == uefi ]]; then swappart=$p2; rootpart=$p3; else swappart=$p2; rootpart=$p3; fi
+   parted -s "$DISK" mkpart primary "${end_mib}MiB" 100%
+ else
+   parted -s "$DISK" mkpart primary "${start_mib}MiB" 100%
+   if [[ $BOOT_MODE == uefi ]]; then rootpart=$p2; else rootpart=$p2; fi
+ fi
+ partprobe "$DISK"; udevadm settle 2>/dev/null || true; sleep 2
+ [[ -b $rootpart ]] || { msg "Could not detect root partition $rootpart. Disk layout not mounted."; return 1; }
+ if [[ $BOOT_MODE == uefi ]]; then mkfs.fat -F32 "$bootpart"; fi
+ if [[ $SWAP == yes ]]; then mkswap "$swappart"; swapon "$swappart" || true; fi
+ case $ROOTFS in ext4) mkfs.ext4 -F "$rootpart";; btrfs) have mkfs.btrfs || fail 'Install btrfs-progs.'; mkfs.btrfs -f "$rootpart";; xfs) have mkfs.xfs || fail 'Install xfsprogs.'; mkfs.xfs -f "$rootpart";; esac
+ mkdir -p "$TARGET"
+ if [[ $ROOTFS == btrfs ]]; then
+   mount "$rootpart" "$TARGET"; btrfs subvolume create "$TARGET/@"; btrfs subvolume create "$TARGET/@home"; umount "$TARGET"
+   mount -o noatime,compress=zstd,subvol=@ "$rootpart" "$TARGET"; mkdir -p "$TARGET/boot" "$TARGET/home"
+   mount -o noatime,compress=zstd,subvol=@home "$rootpart" "$TARGET/home"
+ else mount "$rootpart" "$TARGET"; mkdir -p "$TARGET/boot"; fi
+ MOUNTS+=("$TARGET")
+ if [[ $BOOT_MODE == uefi ]]; then mount "$bootpart" "$TARGET/boot"; MOUNTS+=("$TARGET/boot"); fi
+ mkdir -p "$TARGET/etc"
+ local ru bu su; ru=$(blkid -s UUID -o value "$rootpart")
+ if [[ $ROOTFS == btrfs ]]; then rootopts='defaults,noatime,compress=zstd,subvol=@'; else rootopts='defaults,noatime'; fi
+ printf 'UUID=%s\t/\t%s\t%s\t0 1\n' "$ru" "$ROOTFS" "$rootopts" > "$TARGET/etc/fstab"
+ if [[ $ROOTFS == btrfs ]]; then printf 'UUID=%s\t/home\tbtrfs\tdefaults,noatime,compress=zstd,subvol=@home\t0 2\n' "$ru" >> "$TARGET/etc/fstab"; fi
+ if [[ $BOOT_MODE == uefi ]]; then bu=$(blkid -s UUID -o value "$bootpart"); printf 'UUID=%s\t/boot\tvfat\tumask=0077\t0 2\n' "$bu" >> "$TARGET/etc/fstab"; fi
+ if [[ $SWAP == yes ]]; then su=$(blkid -s UUID -o value "$swappart"); printf 'UUID=%s\tnone\tswap\tsw\t0 0\n' "$su" >> "$TARGET/etc/fstab"; fi
+ msg "Disk prepared. Root: $rootpart\nBoot mode: $BOOT_MODE\nFilesystem: $ROOTFS\nTarget: $TARGET\nReview $TARGET/etc/fstab."
+}
+
+stage3(){
+ local variant channel manifest rel
+ variant=$(menu 'Choose official AMD64 Stage3:' openrc 'OpenRC (standard)' systemd 'systemd (standard)') || return; INIT=$variant
+ channel="current-stage3-amd64-$variant"; manifest="/tmp/latest-stage3-$variant.txt"
+ curl -fL --retry 3 "https://distfiles.gentoo.org/releases/amd64/autobuilds/$channel/latest-stage3-amd64-$variant.txt" -o "$manifest" || { msg 'Cannot fetch Stage3 manifest. Check network.'; return 1; }
+ rel=$(awk '!/^#/ && /stage3-amd64-.*\.tar\.(xz|zst)$/ {print $1; exit}' "$manifest")
+ [[ -n $rel ]] || { msg 'No Stage3 archive found in manifest.'; return 1; }
+ STAGE3_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/$rel"; STAGE3_FILE="/tmp/${rel##*/}"
+ msg "Selected archive:\n$rel\n\nDownloading official Gentoo Stage3."
+ wget -c "$STAGE3_URL" -O "$STAGE3_FILE" || { msg 'Stage3 download failed.'; return 1; }
+ [[ -d $TARGET ]] || mkdir -p "$TARGET"
+ if mountpoint -q "$TARGET"; then :; elif [[ -n $(ls -A "$TARGET") ]]; then msg 'Target is not mounted and is not empty. Refusing to extract.'; return 1; fi
+ tar xpf "$STAGE3_FILE" --xattrs-include='*.*' --numeric-owner -C "$TARGET" || { msg 'Stage3 extraction failed.'; return 1; }
+ msg "Stage3 extracted to $TARGET\nInit: $INIT"
+}
 
 portage_config(){
  local m; m=$(menu 'Distfiles mirror:' official 'Official Gentoo' germany 'FAU Germany' custom 'Custom URL') || return
@@ -129,4 +318,4 @@ main(){
  done
  clear; echo "$APP closed. Do not reboot unless installation completed and boot setup was verified."
 }
-
+main "$@"
